@@ -1,0 +1,4 @@
+export type TokenType='number'|'string'|'identifier'|'operator'|'keyword'|'newline'|'indent'|'dedent'|'eof'|'punct';
+export interface Token {type:TokenType; value:string; line:number; col:number;}
+export type Expr={kind:'literal';value:number|string|boolean|null}|{kind:'name';name:string}|{kind:'array';items:Expr[]}|{kind:'binary';op:string;left:Expr;right:Expr}|{kind:'index';object:Expr;index:Expr}|{kind:'call';name:string;args:Expr[]};
+export type Stmt={kind:'assign';name:string;expr:Expr;line:number}|{kind:'indexAssign';object:string;index:Expr;expr:Expr;line:number}|{kind:'if';test:Expr;body:Stmt[];orelse:Stmt[];line:number}|{kind:'for';name:string;iter:Expr;body:Stmt[];line:number}|{kind:'print';args:Expr[];line:number}|{kind:'function';name:string;params:string[];body:Stmt[];line:number}|{kind:'return';expr?:Expr;line:number};
