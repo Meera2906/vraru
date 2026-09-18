@@ -34,26 +34,6 @@ result = square(5)
 
 print(result)`,
 
-  'Bubble Sort': `numbers = [5, 2, 8, 1, 4]
-
-for i in range(5):
-    for j in range(0, 5 - i - 1):
-        if numbers[j] > numbers[j + 1]:
-            temp = numbers[j]
-            numbers[j] = numbers[j + 1]
-            numbers[j + 1] = temp
-
-print(numbers)`,
-
-  'Factorial Recursion': `def factorial(n):
-    if n <= 1:
-        return 1
-    return n * factorial(n - 1)
-
-result = factorial(5)
-
-print(result)`,
-
   'Sum of Range': `total = 0
 
 for i in range(5):

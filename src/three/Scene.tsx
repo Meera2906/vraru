@@ -1,11 +1,320 @@
+import React, { useRef, useEffect, forwardRef, useImperativeHandle, useState } from 'react';
 import { Canvas, useFrame, useThree } from '@react-three/fiber';
-import { OrbitControls, Text, Float, Environment, Line } from '@react-three/drei';
-import { RuntimeState, Value, RuntimeEvent } from '../types/runtime';
+import { OrbitControls, Text, Float, Environment } from '@react-three/drei';
 import * as THREE from 'three';
-import { useRef, useState, useEffect, useMemo } from 'react';
+import { RuntimeState, Value, RuntimeEvent } from '../types/runtime';
+import { handTracking, HandTrackingResults } from '../services/handTracking';
+import { PhysicsManager } from './PhysicsManager';
+import { SpatialBlockManager, SpatialBlock } from './SpatialBlockManager';
+import { BillboardOverlay, PersonalityMode } from './BillboardOverlay';
 
-// ─── helpers ──────────────────────────────────────────────────────────────────
+export interface SceneRef {
+  spawnOutputTile: (text: string) => void;
+  triggerShatter: () => void;
+  triggerRoast: (message?: string, title?: string) => void;
+  resetPhysics: () => void;
+  snapPrintToFor: () => void;
+  setPersonalityMode: (mode: PersonalityMode) => void;
+}
 
+export interface SceneProps {
+  state?: RuntimeState;
+  spatialMode?: boolean;
+  personalityMode?: PersonalityMode;
+  onTileCountChange?: (count: number, max: number) => void;
+  onBufferOverflow?: () => void;
+  onSnapChange?: (isNested: boolean) => void;
+  showClassicWorld?: boolean;
+}
+
+// ─── 3D Hand Reticle Controller ──────────────────────────────────────────────
+function HandReticle({
+  ndc,
+  isPinching,
+  pinchDistance,
+}: {
+  ndc: { x: number; y: number };
+  isPinching: boolean;
+  pinchDistance: number;
+}) {
+  const groupRef = useRef<THREE.Group>(null);
+  const ringRef = useRef<THREE.Mesh>(null);
+  const { camera } = useThree();
+
+  useFrame(() => {
+    if (!groupRef.current) return;
+
+    // Unproject NDC coordinates to a 3D position in front of camera
+    const v = new THREE.Vector3(ndc.x, ndc.y, 0.5);
+    v.unproject(camera);
+    const dir = v.sub(camera.position).normalize();
+    const targetPos = camera.position.clone().add(dir.multiplyScalar(10));
+
+    groupRef.current.position.lerp(targetPos, 0.35);
+    groupRef.current.quaternion.copy(camera.quaternion);
+
+    if (ringRef.current) {
+      const targetScale = isPinching ? 0.65 : 1.0;
+      ringRef.current.scale.lerp(
+        new THREE.Vector3(targetScale, targetScale, targetScale),
+        0.2
+      );
+    }
+  });
+
+  return (
+    <group ref={groupRef}>
+      {/* Outer target ring */}
+      <mesh ref={ringRef}>
+        <ringGeometry args={[0.22, 0.28, 32]} />
+        <meshBasicMaterial
+          color={isPinching ? '#3ecf8e' : '#38bdf8'}
+          transparent
+          opacity={0.85}
+          side={THREE.DoubleSide}
+        />
+      </mesh>
+
+      {/* Center cursor dot */}
+      <mesh>
+        <circleGeometry args={[0.06, 16]} />
+        <meshBasicMaterial
+          color={isPinching ? '#3ecf8e' : '#f59e0b'}
+          transparent
+          opacity={0.9}
+        />
+      </mesh>
+
+      {/* Subtle glowing halo */}
+      <mesh>
+        <ringGeometry args={[0.35, 0.38, 24]} />
+        <meshBasicMaterial
+          color={isPinching ? '#3ecf8e' : '#38bdf8'}
+          transparent
+          opacity={0.3}
+          side={THREE.DoubleSide}
+        />
+      </mesh>
+    </group>
+  );
+}
+
+// ─── Gesture & Physics Arena Controller ──────────────────────────────────────
+interface ArenaControllerProps {
+  personalityMode: PersonalityMode;
+  onTileCountChange?: (count: number, max: number) => void;
+  onBufferOverflow?: () => void;
+  onSnapChange?: (isNested: boolean) => void;
+  sceneRefObj: React.MutableRefObject<SceneRef | null>;
+}
+
+function ArenaController({
+  personalityMode,
+  onTileCountChange,
+  onBufferOverflow,
+  onSnapChange,
+  sceneRefObj,
+}: ArenaControllerProps) {
+  const { scene, camera, gl } = useThree();
+  const physicsRef = useRef<PhysicsManager | null>(null);
+  const blocksRef = useRef<SpatialBlockManager | null>(null);
+  const billboardRef = useRef<BillboardOverlay | null>(null);
+
+  const [handState, setHandState] = useState<{
+    ndc: { x: number; y: number };
+    isPinching: boolean;
+    pinchDistance: number;
+  }>({
+    ndc: { x: 0, y: 0 },
+    isPinching: false,
+    pinchDistance: 1.0,
+  });
+
+  // Initialize Physics, Blocks, and Billboard
+  useEffect(() => {
+    // 1. Billboard Overlay
+    const billboard = new BillboardOverlay();
+    billboard.setMode(personalityMode);
+    camera.add(billboard.mesh);
+    scene.add(camera);
+    billboardRef.current = billboard;
+
+    // 2. Physics Manager
+    const physics = new PhysicsManager({
+      scene,
+      onTileCountChange,
+      onBufferOverflow: () => {
+        billboard.show();
+        onBufferOverflow?.();
+      },
+    });
+    physicsRef.current = physics;
+
+    // 3. Spatial Block Manager
+    const blocks = new SpatialBlockManager({
+      scene,
+      camera,
+      onSnapChange: (nested) => {
+        onSnapChange?.(nested);
+      },
+    });
+    blocksRef.current = blocks;
+
+    // 4. Hand tracking subscriptions
+    const unsubResults = handTracking.onResults((res: HandTrackingResults) => {
+      setHandState({
+        ndc: res.ndc,
+        isPinching: res.isPinching,
+        pinchDistance: res.pinchDistance,
+      });
+      blocks.updatePointer(res.ndc);
+    });
+
+    const unsubPinchStart = handTracking.onPinchStart((ndc) => {
+      blocks.handlePinchStart(ndc);
+    });
+
+    const unsubPinchEnd = handTracking.onPinchEnd((ndc) => {
+      blocks.handlePinchEnd(ndc);
+    });
+
+    // 5. Expose Imperative Controls
+    sceneRefObj.current = {
+      spawnOutputTile: (text: string) => {
+        physics.spawnOutputTile(text);
+      },
+      triggerShatter: () => {
+        physics.triggerShatterEvent();
+        billboard.show();
+      },
+      triggerRoast: (message?: string, title?: string) => {
+        billboard.show(message, title);
+      },
+      resetPhysics: () => {
+        physics.reset();
+      },
+      snapPrintToFor: () => {
+        blocks.snapPrintToFor();
+      },
+      setPersonalityMode: (mode: PersonalityMode) => {
+        billboard.setMode(mode);
+      },
+    };
+
+    return () => {
+      unsubResults();
+      unsubPinchStart();
+      unsubPinchEnd();
+      physics.dispose();
+      blocks.clear();
+      camera.remove(billboard.mesh);
+      billboard.dispose();
+      sceneRefObj.current = null;
+    };
+  }, [scene, camera, onTileCountChange, onBufferOverflow, onSnapChange]);
+
+  // Update Personality Mode
+  useEffect(() => {
+    if (billboardRef.current) {
+      billboardRef.current.setMode(personalityMode);
+    }
+  }, [personalityMode]);
+
+  // Mouse / Pointer fallback on Canvas element
+  useEffect(() => {
+    const dom = gl.domElement;
+
+    const handlePointerDown = (e: PointerEvent) => {
+      const rect = dom.getBoundingClientRect();
+      const x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+      const y = -(((e.clientY - rect.top) / rect.height) * 2 - 1);
+      const ndc = { x, y };
+
+      setHandState((prev) => ({ ...prev, ndc, isPinching: true }));
+      handTracking.simulatePinchStart(ndc);
+      blocksRef.current?.handlePinchStart(ndc);
+    };
+
+    const handlePointerMove = (e: PointerEvent) => {
+      const rect = dom.getBoundingClientRect();
+      const x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+      const y = -(((e.clientY - rect.top) / rect.height) * 2 - 1);
+      const ndc = { x, y };
+
+      setHandState((prev) => ({ ...prev, ndc }));
+      handTracking.simulatePinchMove(ndc);
+      blocksRef.current?.updatePointer(ndc);
+    };
+
+    const handlePointerUp = (e: PointerEvent) => {
+      const rect = dom.getBoundingClientRect();
+      const x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+      const y = -(((e.clientY - rect.top) / rect.height) * 2 - 1);
+      const ndc = { x, y };
+
+      setHandState((prev) => ({ ...prev, isPinching: false }));
+      handTracking.simulatePinchEnd(ndc);
+      blocksRef.current?.handlePinchEnd(ndc);
+    };
+
+    dom.addEventListener('pointerdown', handlePointerDown);
+    dom.addEventListener('pointermove', handlePointerMove);
+    dom.addEventListener('pointerup', handlePointerUp);
+
+    return () => {
+      dom.removeEventListener('pointerdown', handlePointerDown);
+      dom.removeEventListener('pointermove', handlePointerMove);
+      dom.removeEventListener('pointerup', handlePointerUp);
+    };
+  }, [gl.domElement]);
+
+  // Main Render & Physics Tick (Capped at 0.1s max step)
+  useFrame((_, delta) => {
+    if (physicsRef.current) {
+      physicsRef.current.step(delta);
+    }
+    if (blocksRef.current) {
+      blocksRef.current.update(delta);
+    }
+    if (billboardRef.current) {
+      billboardRef.current.update(delta);
+    }
+  });
+
+  return (
+    <>
+      <HandReticle
+        ndc={handState.ndc}
+        isPinching={handState.isPinching}
+        pinchDistance={handState.pinchDistance}
+      />
+
+      {/* Floating 3D Zone Title for Blocks */}
+      <Text
+        position={[-5.8, 4.4, 0]}
+        fontSize={0.4}
+        color="#38bdf8"
+        letterSpacing={0.1}
+        anchorX="center"
+      >
+        SPATIAL CODE BLOCKS [PINCH & SNAP]
+      </Text>
+
+      {/* Floating 3D Zone Title for Output Bin */}
+      <Text
+        position={[6.5, 4.4, 0]}
+        fontSize={0.4}
+        color="#60a5fa"
+        letterSpacing={0.1}
+        anchorX="center"
+      >
+        ACRYLIC OUTPUT BIN [35 MAX]
+      </Text>
+    </>
+  );
+}
+
+// ─── Helpers for Classic Python Runtime Visualizer ───────────────────────────
 function fmt(v: Value): string {
   if (Array.isArray(v)) return `[${(v as Value[]).map(fmt).join(', ')}]`;
   if (v === null) return 'None';
@@ -13,111 +322,49 @@ function fmt(v: Value): string {
   return String(v);
 }
 
-function lerp(a: number, b: number, t: number) {
-  return a + (b - a) * t;
-}
-
-function isArrayValue(value: Value): value is Value[] {
-  return Array.isArray(value);
-}
-
-// ─── Data Orb Animation ───────────────────────────────────────────────────────
-
-function DataOrb({
-  from,
-  to,
-  label,
-  color,
-  onComplete,
-}: {
-  from: THREE.Vector3;
-  to: THREE.Vector3;
-  label: string;
-  color?: string;
-  onComplete?: () => void;
-}) {
-  const meshRef = useRef<THREE.Mesh>(null);
-  const [progress, setProgress] = useState(0);
-
-  useEffect(() => {
-    setProgress(0);
-  }, [from, to, label]);
-
-  useFrame((_, delta) => {
-    if (progress < 1) {
-      setProgress((p) => Math.min(1, p + delta * 1.6));
-    } else if (onComplete) {
-      onComplete();
-    }
-
-    if (meshRef.current) {
-      const x = lerp(from.x, to.x, progress);
-      const z = lerp(from.z, to.z, progress);
-      const baseY = lerp(from.y, to.y, progress);
-      const arc = Math.sin(progress * Math.PI) * 1.5;
-      meshRef.current.position.set(x, baseY + arc, z);
-      meshRef.current.rotation.y += delta * 1.5;
-    }
-  });
-
-  if (progress >= 1) return null;
-
+function Region({ title, position, size, children }: any) {
   return (
-    <mesh ref={meshRef}>
-      <sphereGeometry args={[0.25, 18, 18]} />
-      <meshStandardMaterial color={color ?? '#4d9eff'} emissive={color ?? '#4d9eff'} emissiveIntensity={2.8} />
-      <Text position={[0, 0.4, 0]} fontSize={0.22} color="#ffffff" anchorX="center">
-        {label}
+    <group position={position}>
+      <mesh position={[0, -0.5, 0]}>
+        <boxGeometry args={[size[0], 0.2, size[1]]} />
+        <meshStandardMaterial color="#050810" metalness={0.1} roughness={0.9} />
+      </mesh>
+      <lineSegments position={[0, -0.5, 0]}>
+        <edgesGeometry args={[new THREE.BoxGeometry(size[0], 0.2, size[1])]} />
+        <lineBasicMaterial color="#1e2d3d" transparent opacity={0.6} />
+      </lineSegments>
+      <Text
+        position={[0, -0.39, -size[1] / 2 + 1.2]}
+        rotation={[-Math.PI / 2, 0, 0]}
+        fontSize={1.2}
+        color="#15202e"
+        anchorX="center"
+        letterSpacing={0.2}
+      >
+        {title}
       </Text>
-    </mesh>
+      {children}
+    </group>
   );
 }
 
-// ─── Variable Capsule ─────────────────────────────────────────────────────────
-
-interface MemoryNodeProps {
-  name: string;
-  value: Value;
-  position: [number, number, number];
-  active: boolean;
-}
-
-function MemoryNode({ name, value, position, active }: MemoryNodeProps) {
+function VarCard({ name, value, x, y, z }: any) {
   const displayValue = fmt(value);
-  const valueColor =
-    typeof value === 'number'
-      ? '#fbbf24'
-      : typeof value === 'boolean'
-        ? value
-          ? '#34d399'
-          : '#f87171'
-        : '#8bd3ff';
-
   return (
-    <Float speed={1.1} rotationIntensity={0.04} floatIntensity={0.2}>
-      <group position={position}>
-        <mesh position={[0, 0.5, 0]}>
-          <cylinderGeometry args={[0.9, 1, 1.3, 18]} />
-          <meshStandardMaterial
-            color={active ? '#13263d' : '#0c141d'}
-            metalness={0.45}
-            roughness={0.4}
-            emissive={active ? '#4d9eff' : '#0d1b2a'}
-            emissiveIntensity={active ? 1.1 : 0.25}
-          />
+    <Float speed={1.2} rotationIntensity={0.03} floatIntensity={0.12}>
+      <group position={[x, y, z]}>
+        <mesh>
+          <boxGeometry args={[3.0, 1.6, 0.22]} />
+          <meshStandardMaterial color="#0f1822" metalness={0.3} roughness={0.6} />
         </mesh>
-        <mesh position={[0, 1.25, 0]}>
-          <sphereGeometry args={[0.65, 18, 18]} />
-          <meshStandardMaterial
-            color={active ? '#1a3d62' : '#0d1b2a'}
-            emissive={active ? '#4d9eff' : '#0d1b2a'}
-            emissiveIntensity={active ? 1.6 : 0.3}
-          />
-        </mesh>
-        <Text position={[0, 1.7, 0]} fontSize={0.18} color="#98abc0" anchorX="center" letterSpacing={0.05}>
+        <lineSegments>
+          <edgesGeometry args={[new THREE.BoxGeometry(3.0, 1.6, 0.22)]} />
+          <lineBasicMaterial color="#1e2d3d" transparent opacity={0.8} />
+        </lineSegments>
+        <Text position={[0, 0.4, 0.15]} fontSize={0.22} color="#6b8aa8" anchorX="center" letterSpacing={0.08}>
           {name.toUpperCase()}
         </Text>
-        <Text position={[0, 0.2, 0.7]} fontSize={displayValue.length > 6 ? 0.22 : 0.28} color={valueColor} anchorX="center">
+        <Text position={[0, -0.15, 0.15]} fontSize={displayValue.length > 8 ? 0.24 : 0.35} color="#3ecf8e" anchorX="center" maxWidth={2.8}>
           {displayValue}
         </Text>
       </group>
@@ -125,168 +372,23 @@ function MemoryNode({ name, value, position, active }: MemoryNodeProps) {
   );
 }
 
-// ─── Array View ───────────────────────────────────────────────────────────────
-
-interface ArrayViewProps {
-  name: string;
-  values: Value[];
-  activeIndex?: number;
-  maxVar?: Value;
-  position: [number, number, number];
-}
-
-function ArrayView({ name, values, activeIndex, maxVar, position }: ArrayViewProps) {
-  const cellWidth = 1.4;
-  const totalWidth = values.length * cellWidth;
-  const startX = -totalWidth / 2 + cellWidth / 2;
-
-  return (
-    <group position={position}>
-      <Text position={[0, 1.4, 0.1]} fontSize={0.24} color="#9bb1c8" anchorX="center" letterSpacing={0.06}>
-        {name.toUpperCase()}
-      </Text>
-      <Line
-        points={[
-          [-totalWidth / 2 - 0.3, 0, 0],
-          [totalWidth / 2 + 0.3, 0, 0],
-        ]}
-        color="#4f6c87"
-        lineWidth={1}
-        transparent
-        opacity={0.7}
-      />
-
-      {values.map((v, i) => {
-        const cx = startX + i * cellWidth;
-        const isActive = i === activeIndex;
-        const isMax = maxVar !== undefined && v === maxVar;
-        const hoverY = isActive ? 0.9 : isMax ? 0.45 : 0;
-
-        return (
-          <group key={i} position={[cx, hoverY, 0]}>
-            {isActive && (
-              <mesh position={[0, 1.1, 0]}>
-                <coneGeometry args={[0.18, 0.42, 14]} />
-                <meshStandardMaterial color="#4d9eff" emissive="#4d9eff" emissiveIntensity={1.8} />
-              </mesh>
-            )}
-            <mesh>
-              <boxGeometry args={[1.05, 0.95, 0.45]} />
-              <meshStandardMaterial
-                color={isActive ? '#162038' : isMax ? '#1d1a06' : '#111d2b'}
-                metalness={0.25}
-                roughness={0.65}
-                emissive={isActive ? '#123056' : isMax ? '#3b3200' : '#0a111a'}
-                emissiveIntensity={isActive ? 1.2 : isMax ? 0.8 : 0.2}
-              />
-            </mesh>
-            <lineSegments>
-              <edgesGeometry args={[new THREE.BoxGeometry(1.05, 0.95, 0.45)]} />
-              <lineBasicMaterial color={isActive ? '#4d9eff' : isMax ? '#fbbf24' : '#2d425b'} transparent opacity={0.9} />
-            </lineSegments>
-            <Text position={[0, 0.06, 0.26]} fontSize={0.26} color="#edf5ff" anchorX="center">
-              {fmt(v)}
-            </Text>
-            <Text position={[0, -0.7, 0.12]} fontSize={0.15} color="#55708b" anchorX="center">
-              {i}
-            </Text>
-          </group>
-        );
-      })}
-    </group>
-  );
-}
-
-// ─── Control Flow Graph ───────────────────────────────────────────────────────
-
-interface FlowNodeProps {
-  label: string;
-  position: [number, number, number];
-  active?: boolean;
-  accent?: string;
-}
-
-function FlowNode({ label, position, active = false, accent = '#4d9eff' }: FlowNodeProps) {
-  return (
-    <Float speed={1.3} rotationIntensity={0.05} floatIntensity={0.15}>
-      <group position={position}>
-        <mesh>
-          <cylinderGeometry args={[1.2, 1.2, 0.4, 18]} />
-          <meshStandardMaterial
-            color={active ? '#112843' : '#0d151d'}
-            metalness={0.5}
-            roughness={0.45}
-            emissive={active ? accent : '#0f1d2a'}
-            emissiveIntensity={active ? 1.3 : 0.3}
-          />
-        </mesh>
-        <Text position={[0, 0.75, 0]} fontSize={0.2} color="#dfeaf8" anchorX="center">
-          {label}
-        </Text>
-      </group>
-    </Float>
-  );
-}
-
-function ConditionGate({
-  expression,
-  result,
-  position,
-}: {
-  expression?: string;
-  result?: boolean;
-  position: [number, number, number];
-}) {
-  const gateColor = result ? '#34d399' : '#f87171';
-
-  return (
-    <group position={position}>
-      <Text position={[0, 1.15, 0.1]} fontSize={0.22} color="#a7bfd9" anchorX="center">
-        {expression ?? 'CONDITION'}
-      </Text>
-      <mesh position={[0, 0, 0]}>
-        <octahedronGeometry args={[0.9, 0]} />
-        <meshStandardMaterial color="#0d1724" emissive={gateColor} emissiveIntensity={1.2} metalness={0.4} roughness={0.4} />
-      </mesh>
-      <Text position={[0, -0.7, 0.1]} fontSize={0.26} color={gateColor} anchorX="center">
-        {result ? 'TRUE' : 'FALSE'}
-      </Text>
-      <Line
-        points={[
-          [-2.8, 0.2, 0],
-          [-1.4, 0.2, 0],
-        ]}
-        color={result ? '#34d399' : '#4d9eff'}
-        lineWidth={1.2}
-      />
-      <Line
-        points={[
-          [1.4, 0.2, 0],
-          [2.8, 0.2, 0],
-        ]}
-        color={result ? '#f87171' : '#4d9eff'}
-        lineWidth={1.2}
-      />
-    </group>
-  );
-}
-
-// ─── Output Panel ─────────────────────────────────────────────────────────────
-
 function OutputPanel({ lines }: { lines: string[] }) {
-  const panelHeight = Math.max(1.8, 1.1 + lines.length * 0.38);
-
+  const height = 2 + lines.length * 0.5;
   return (
-    <group position={[0, panelHeight / 2, 0]}>
+    <group position={[0, height / 2 + 0.5, 0]}>
       <mesh>
-        <boxGeometry args={[5.6, panelHeight, 0.18]} />
-        <meshStandardMaterial color="#0b1d16" metalness={0.25} roughness={0.7} emissive="#0d452d" emissiveIntensity={0.35} />
+        <boxGeometry args={[6, height, 0.2]} />
+        <meshStandardMaterial color="#0a1a0d" metalness={0.2} roughness={0.6} />
       </mesh>
-      <Text position={[0, panelHeight / 2 - 0.25, 0.12]} fontSize={0.18} color="#8ef7c8" anchorX="center">
-        OUTPUT
+      <lineSegments>
+        <edgesGeometry args={[new THREE.BoxGeometry(6, height, 0.2)]} />
+        <lineBasicMaterial color="#3ecf8e" transparent opacity={0.6} />
+      </lineSegments>
+      <Text position={[0, height / 2 - 0.5, 0.12]} fontSize={0.3} color="#3ecf8e" anchorX="center" letterSpacing={0.1}>
+        OUTPUT TERMINAL
       </Text>
       {lines.map((line, i) => (
-        <Text key={i} position={[0, panelHeight / 2 - 0.6 - i * 0.34, 0.12]} fontSize={0.18} color="#edf6ff" anchorX="center">
+        <Text key={i} position={[0, height / 2 - 1.2 - i * 0.5, 0.12]} fontSize={0.4} color="#e8edf3" anchorX="center">
           {line}
         </Text>
       ))}
@@ -294,279 +396,89 @@ function OutputPanel({ lines }: { lines: string[] }) {
   );
 }
 
-// ─── Camera Rig ───────────────────────────────────────────────────────────────
+// ─── Scene Root Component ───────────────────────────────────────────────────
+const Scene = forwardRef<SceneRef, SceneProps>(function Scene(
+  {
+    state,
+    spatialMode = false,
+    personalityMode = 'quirky',
+    onTileCountChange,
+    onBufferOverflow,
+    onSnapChange,
+    showClassicWorld = false,
+  },
+  ref
+) {
+  const internalRef = useRef<SceneRef | null>(null);
 
-function CameraRig({ spatialMode, event }: { spatialMode: boolean; event?: RuntimeEvent }) {
-  const { camera } = useThree();
-  const targetPos = useRef(new THREE.Vector3(0, 18, 24));
-  const targetLook = useRef(new THREE.Vector3(0, 0, 0));
-  const currentLook = useRef(new THREE.Vector3(0, 0, 0));
+  useImperativeHandle(ref, () => ({
+    spawnOutputTile: (text: string) => internalRef.current?.spawnOutputTile(text),
+    triggerShatter: () => internalRef.current?.triggerShatter(),
+    triggerRoast: (msg?: string, title?: string) => internalRef.current?.triggerRoast(msg, title),
+    resetPhysics: () => internalRef.current?.resetPhysics(),
+    snapPrintToFor: () => internalRef.current?.snapPrintToFor(),
+    setPersonalityMode: (mode: PersonalityMode) => internalRef.current?.setPersonalityMode(mode),
+  }));
 
-  useEffect(() => {
-    if (spatialMode) {
-      targetPos.current.set(0, 24, 30);
-      targetLook.current.set(0, 1.5, 0);
-      return;
-    }
-
-    const type = event?.type;
-    if (!type) return;
-
-    if (type.startsWith('VARIABLE_')) {
-      targetPos.current.set(10, 7, 12);
-      targetLook.current.set(10, 1, -2);
-    } else if (type === 'ARRAY_CREATED' || type === 'LOOP_ITERATION') {
-      targetPos.current.set(-10, 7, 12);
-      targetLook.current.set(-10, 1, -2);
-    } else if (type === 'CONDITION_EVALUATED' || type === 'BRANCH_TAKEN') {
-      targetPos.current.set(0, 8, 15);
-      targetLook.current.set(0, 4, 1);
-    } else if (type === 'OUTPUT') {
-      targetPos.current.set(0, 6, -8);
-      targetLook.current.set(0, 0, -10);
-    } else {
-      targetPos.current.set(0, 18, 24);
-      targetLook.current.set(0, 0, 0);
-    }
-  }, [spatialMode, event]);
-
-  useFrame(() => {
-    camera.position.lerp(targetPos.current, 0.05);
-    currentLook.current.lerp(targetLook.current, 0.05);
-    camera.lookAt(currentLook.current);
-  });
-
-  return null;
-}
-
-interface WorldProps {
-  state?: RuntimeState;
-  spatialMode: boolean;
-  visualMode?: 'live' | 'flow' | 'memory' | 'data' | 'ast';
-}
-
-function World({ state, spatialMode, visualMode = 'live' }: WorldProps) {
   const vars = state ? Object.entries(state.variables) : [];
-  const scalarVars = vars.filter(([, v]) => !isArrayValue(v));
-  const arrayVars = vars.filter(([, v]) => isArrayValue(v));
-
-  const ev = state?.event;
-  const activeArrayName = ev?.arrayName;
-  const activeIndex = ev?.type === 'LOOP_ITERATION' ? ev.loopIndex : undefined;
-  const changedVarName = ev?.name;
-
-  const memoryPositions = useMemo(
-    () =>
-      scalarVars.map(([,], idx) => {
-        const x = 10 + (idx % 2) * 3;
-        const y = 1.5 + Math.floor(idx / 2) * 1.7;
-        const z = -3 + (idx % 2) * 2.5;
-        return [x, y, z] as [number, number, number];
-      }),
-    [scalarVars]
-  );
-
-  const arrayPositions = useMemo(
-    () =>
-      arrayVars.map(([,], idx) => {
-        const x = -11 + (idx % 2) * 0.5;
-        const y = 1 + idx * 2.2;
-        const z = -3 + (idx % 2) * 2.8;
-        return [x, y, z] as [number, number, number];
-      }),
-    [arrayVars]
-  );
-
-  const arrayMap = arrayVars.reduce<Record<string, [number, number, number]>>((acc, [name], idx) => {
-    acc[name] = arrayPositions[idx] ?? [-11, 1, -3];
-    return acc;
-  }, {});
-
-  const memoryMap = scalarVars.reduce<Record<string, [number, number, number]>>((acc, [name], idx) => {
-    acc[name] = memoryPositions[idx] ?? [10, 1.5, -3];
-    return acc;
-  }, {});
-
-  const [transfer, setTransfer] = useState<{
-    from: THREE.Vector3;
-    to: THREE.Vector3;
-    label: string;
-    color: string;
-  } | null>(null);
-
-  useEffect(() => {
-    if (ev?.type === 'VARIABLE_UPDATED' && ev.name && ev.value !== undefined) {
-      const from = new THREE.Vector3(0, 6, 3);
-      const target = memoryMap[ev.name] ?? [10, 1.5, -3];
-      setTransfer({
-        from,
-        to: new THREE.Vector3(target[0], target[1], target[2]),
-        label: fmt(ev.value),
-        color: '#4d9eff',
-      });
-    } else if (ev?.type === 'LOOP_ITERATION' && ev.arrayName && ev.name) {
-      const target = memoryMap[ev.name] ?? [10, 1.5, -3];
-      const origin = arrayMap[ev.arrayName] ?? [-11, 1, -3];
-      setTransfer({
-        from: new THREE.Vector3(origin[0], origin[1], origin[2]),
-        to: new THREE.Vector3(target[0], target[1], target[2]),
-        label: fmt(ev.value ?? 0),
-        color: '#34d399',
-      });
-    }
-  }, [ev, memoryMap, arrayMap]);
-
-  const flowNodes = [
-    { label: 'START', position: [-6, 5.5, 1] as [number, number, number], active: ev?.type === 'PROGRAM_START' || !ev },
-    { label: 'ARRAY', position: [-3, 4.2, -1] as [number, number, number], active: ev?.type === 'ARRAY_CREATED' || ev?.type === 'LOOP_ITERATION', accent: '#8bd3ff' },
-    { label: 'LOOP', position: [0, 5.2, 2] as [number, number, number], active: ev?.type === 'LOOP_STARTED' || ev?.type === 'LOOP_ITERATION', accent: '#34d399' },
-    { label: 'COND', position: [3.8, 4.2, 1] as [number, number, number], active: ev?.type === 'CONDITION_EVALUATED' || ev?.type === 'BRANCH_TAKEN', accent: '#fbbf24' },
-    { label: 'UPDATE', position: [7.2, 5.5, -1] as [number, number, number], active: ev?.type === 'VARIABLE_UPDATED', accent: '#4d9eff' },
-    { label: 'OUT', position: [0, 1.2, -9] as [number, number, number], active: ev?.type === 'OUTPUT', accent: '#34d399' },
-  ];
-
-  const activeCursor = useMemo(() => {
-    if (ev?.type === 'LOOP_ITERATION' && activeArrayName && activeIndex !== undefined) {
-      const arrPos = arrayMap[activeArrayName] ?? [-11, 1, -3];
-      const values = (arrayVars.find(([name]) => name === activeArrayName)?.[1] as Value[] | undefined) ?? [];
-      const cellWidth = 1.4;
-      const totalWidth = values.length * cellWidth;
-      const startX = -totalWidth / 2 + cellWidth / 2;
-      const cursorX = arrPos[0] + startX + activeIndex * cellWidth;
-      return new THREE.Vector3(cursorX, 2.2, arrPos[2] + 0.6);
-    }
-
-    if (ev?.type === 'CONDITION_EVALUATED') {
-      return new THREE.Vector3(4, 4, 1.5);
-    }
-
-    if (ev?.type === 'VARIABLE_UPDATED' && ev.name) {
-      const position = memoryMap[ev.name] ?? [10, 1.5, -3];
-      return new THREE.Vector3(position[0], position[1] + 1.4, position[2]);
-    }
-
-    if (ev?.type === 'OUTPUT') {
-      return new THREE.Vector3(0, 1.6, -9);
-    }
-
-    return new THREE.Vector3(-6, 5.5, 1);
-  }, [ev, activeArrayName, activeIndex, arrayMap, arrayVars, memoryMap]);
-
-  const lines: [number, number, number][] = [
-    [-6, 5.5, 1],
-    [-3, 4.2, -1],
-    [0, 5.2, 2],
-    [3.8, 4.2, 1],
-    [7.2, 5.5, -1],
-    [0, 1.2, -9],
-  ];
+  const scalarVars = vars.filter(([, v]) => !Array.isArray(v));
 
   return (
-    <>
-      <ambientLight intensity={0.7} />
-      <directionalLight position={[10, 18, 12]} intensity={1.5} castShadow />
-      <pointLight position={[-9, 6, -4]} intensity={0.8} color="#67b5ff" />
-      <pointLight position={[9, 6, -4]} intensity={0.8} color="#fbbf24" />
-      <pointLight position={[0, 7, 8]} intensity={0.6} color="#34d399" />
+    <div className="scene" style={{ width: '100%', height: '100%', position: 'relative' }}>
+      <Canvas
+        camera={{ position: [0, 4, 12], fov: 50 }}
+        shadows
+        gl={{ antialias: true, alpha: false, preserveDrawingBuffer: true }}
+      >
+        <color attach="background" args={['#03060d']} />
+        <fog attach="fog" args={['#03060d', 15, 55]} />
 
-      <gridHelper args={[80, 80, '#1a2535', '#0a0f16']} position={[0, -0.6, 0]} />
-      <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, -0.59, 0]}>
-        <circleGeometry args={[13, 64]} />
-        <meshStandardMaterial color="#081018" transparent opacity={0.32} />
-      </mesh>
+        {/* Lighting setup */}
+        <ambientLight intensity={0.7} />
+        <directionalLight position={[8, 16, 12]} intensity={1.8} castShadow />
+        <pointLight position={[-8, 6, 2]} intensity={1.2} color="#38bdf8" />
+        <pointLight position={[8, 6, 2]} intensity={1.2} color="#f59e0b" />
+        <pointLight position={[0, 4, 8]} intensity={0.9} color="#3ecf8e" />
 
-      <CameraRig spatialMode={spatialMode} event={ev} />
+        {/* Floor Grid */}
+        <gridHelper args={[60, 60, '#1e293b', '#0b111e']} position={[0, -0.6, 0]} />
 
-      {transfer && (
-        <DataOrb
-          from={transfer.from}
-          to={transfer.to}
-          label={transfer.label}
-          color={transfer.color}
-          onComplete={() => setTransfer(null)}
+        {/* GestureBlocks AR Controller (Physics, Sockets, Blocks, Billboard) */}
+        <ArenaController
+          personalityMode={personalityMode}
+          onTileCountChange={onTileCountChange}
+          onBufferOverflow={onBufferOverflow}
+          onSnapChange={onSnapChange}
+          sceneRefObj={internalRef}
         />
-      )}
 
-      <mesh position={[0, 3.4, 3.2]}>
-        <torusGeometry args={[6.2, 0.08, 16, 120]} />
-        <meshStandardMaterial color="#20364d" transparent opacity={0.5} emissive="#1d4c78" emissiveIntensity={0.35} />
-      </mesh>
+        {/* Optional Classic Python Runtime World */}
+        {showClassicWorld && (
+          <group position={[0, 0, -8]}>
+            <Region title="MEMORY" position={[-8, 0, 0]} size={[8, 8]}>
+              {scalarVars.map(([k, v], i) => (
+                <VarCard key={k} name={k} value={v} x={-1.5 + (i % 2) * 3} y={1.5} z={-2 + Math.floor(i / 2) * 2.5} />
+              ))}
+            </Region>
+            <Region title="OUTPUT" position={[8, 0, 0]} size={[8, 8]}>
+              <OutputPanel lines={state?.output ?? []} />
+            </Region>
+          </group>
+        )}
 
-      {flowNodes.map((node, index) => (
-        <FlowNode key={node.label + index} label={node.label} position={node.position} active={node.active} accent={node.accent} />
-      ))}
-
-      <Line
-        points={lines.map((point) => point)}
-        color={visualMode === 'flow' ? '#4d9eff' : '#375066'}
-        lineWidth={1.2}
-        transparent
-        opacity={0.8}
-      />
-
-      {ev && (ev.type === 'CONDITION_EVALUATED' || ev.type === 'BRANCH_TAKEN') && (
-        <ConditionGate expression={ev.expression} result={ev.result} position={[3.8, 0.8, 1]} />
-      )}
-
-      <group position={[0, 0, -3]}>
-        {arrayVars.map(([name, value], idx) => (
-          <ArrayView
-            key={name}
-            name={name}
-            values={value as Value[]}
-            activeIndex={activeArrayName === name ? activeIndex : undefined}
-            maxVar={state?.variables.max_value}
-            position={arrayPositions[idx] ?? [-11, 1, -3]}
-          />
-        ))}
-      </group>
-
-      <group position={[0, 0, 0]}>
-        {scalarVars.map(([name, value], idx) => (
-          <MemoryNode
-            key={name}
-            name={name}
-            value={value}
-            position={memoryPositions[idx] ?? [10, 1.5, -3]}
-            active={name === changedVarName}
-          />
-        ))}
-      </group>
-
-      <mesh position={activeCursor.toArray() as [number, number, number]}>
-        <icosahedronGeometry args={[0.2, 0]} />
-        <meshStandardMaterial color="#d3f0ff" emissive="#d3f0ff" emissiveIntensity={2.2} />
-      </mesh>
-
-      <group position={[0, 0, -10]}>
-        <OutputPanel lines={state?.output ?? []} />
-      </group>
-
-      {visualMode !== 'flow' && (
-        <Text position={[10.5, 5, -4.5]} fontSize={0.25} color="#8aa6bc" anchorX="left">
-          {visualMode.toUpperCase()} MODE
-        </Text>
-      )}
-    </>
-  );
-}
-
-interface SceneProps {
-  state?: RuntimeState;
-  spatialMode?: boolean;
-  visualMode?: 'live' | 'flow' | 'memory' | 'data' | 'ast';
-}
-
-export default function Scene({ state, spatialMode = false, visualMode = 'live' }: SceneProps) {
-  return (
-    <div className="scene">
-      <Canvas camera={{ position: [0, 18, 24], fov: 45 }} shadows gl={{ antialias: true, alpha: false }}>
-        <color attach="background" args={['#030508']} />
-        <fog attach="fog" args={['#030508', 24, 70]} />
-        <World state={state} spatialMode={spatialMode} visualMode={visualMode} />
-        <OrbitControls enablePan enableZoom minDistance={6} maxDistance={50} dampingFactor={0.08} enableDamping />
+        <OrbitControls
+          enablePan={true}
+          enableZoom={true}
+          minDistance={4}
+          maxDistance={30}
+          dampingFactor={0.08}
+          enableDamping={true}
+          maxPolarAngle={Math.PI / 2 - 0.05} // Keep camera above floor
+        />
         <Environment preset="city" />
       </Canvas>
     </div>
   );
-}
+});
+
+export default Scene;
